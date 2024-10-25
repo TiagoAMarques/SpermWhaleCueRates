@@ -1,0 +1,17 @@
+knitr
+readxl
+ggplot2
+data.table
+Matrix
+lme4
+nlme
+nimble
+tidyverse
+tibble
+tidyr
+readr
+purrr
+dplyr
+stringr
+forcats
+lubridate

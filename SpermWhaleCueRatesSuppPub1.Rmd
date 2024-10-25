@@ -1,0 +1,1235 @@
+
+---
+title: Code for producing results and figures of "Estimating sperm whale cue rates
+  to inform passive acoustic density estimation via cue counting"
+author: "Marques, T. A."
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '5'
+  pdf_document:
+    toc: yes
+    toc_depth: 5
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    force_captions: yes
+    highlight: pygments
+    number_sections: yes
+    theme: cerulean
+    df_print: paged
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,cache=TRUE)
+library(knitr)
+library(readxl)
+library(tidyverse)
+library(data.table)
+#for GLMMs
+library(lme4)
+library(nlme)
+#trying NIMBLE for Bayesian implementation
+library(nimble)
+set.seed(2024)
+```
+
+# Introduction
+
+This document includes the code required to reproduce the analysis and resulting figures for the manuscript "Estimating sperm whale cue rates to inform passive acoustic density estimation via cue counting", submitted to The Journal of the Acoustical Society of America, by **add all names here**. 
+
+In the paper we report on estimates of cue rates for sperm whales at a selection of time and year combinations that were sampled, but the main interest is in estimating a mean cue rate, and corresponding precision, for a time and location that might not have been observed. We also look at how a number of additional covariates can impact cue rates.
+
+This is hosted in a dedicated github repository at
+
+https://github.com/TiagoAMarques/SpermWhaleCueRates/
+
+# Related repositories and files
+
+## Related repositories
+
+This document was created by simplification of another document describing lots of dead ends and open questions related to Gamma GLMMs and their implementation both in `lme4::glmer` and in a Bayesian context.
+
+These analysis and the data to make it fully reproducible are hosted at 
+
+https://github.com/TiagoAMarques/Report4BB
+
+in case that helps the readers.
+
+Nonetheless, the document presented here is self contained.
+
+# Related Files
+
+For this code to run the file clall.txt is required, but that file is over 400Gb. I will archive it as a file somewhere but in the mean time you can download it from here. 
+
+"https://www.dropbox.com/scl/fi/eihokxcimaz15y83c4v37/clall.txt?rlkey=uyz2l2l8zrzbx6b73dnio3mji&dl=0"
+
+# About the data used for analysis
+
+The main dataset lies within `ddata1`, the single object in `data_4_article_clickrates_deep_dive.rda` that gets front loaded below. Under 
+
+https://github.com/TiagoAMarques/Report4BB
+
+there are additional details about how this object is created, but for the purpose of this paper, this R data file should be treated as data.
+
+The data in `ddata1` consists of summaries of numbers of regular echolocation clicks per deep dive cycle, for each of the sperm whale tags considered on the manuscript. Note that despite having been recorded at the deep dive cycle level, a level which was also considered for comparisons in the manuscript 
+
+Marques, T. A., Marques, C. S. & and Gkikopoulou, K. C. (2023) A sperm whale cautionary tale about estimating acoustic cue rates for deep divers. \textit{The Journal of the Acoustical Society of America} \textbf{154}: 1577-1584
+
+the first step in the data pre-processing below is to pool data for each tag record, as the tag is the fundamental (and more importantly independent) sampling unit we consider here.
+
+# Reading the data
+
+We begin by reading the deep dive cycle data in:
+
+```{r}
+# file created in Cue_Rates_For_Sperm_Whales.Rmd
+# Reading the data that contain the information per deep dive cycle - object ddata1
+load("data/data_4_article_clickrates_deep_dive.rda")
+ddata1$location[ddata1$location=="Gulf of Mexico"]<-"GoM"
+ddata1$location[ddata1$location=="North Atlantic Delaware"]<-"Delaware"
+ddata1$location[ddata1$location=="DOMINICA"]<-"Dominica"
+ddata1$location[ddata1$location=="Norway Andenes"]<-"Norway"
+```
+
+# Data pre-processing
+
+We actually have data from whales which have been subjected to SONAR exposure under controlled exposure experiments. We discard the data from those tags here, since evaluating the effect of SONAR is the focus of other research programs. Understanding the effects of sonar exposure on whale behaviour, and in particular cue rate production, is a separate research thread which requires information to be analysed at a much finer resolution, and for which context would have to be considered. For the majority of the tags the context information is unavailable to us within the ACCURATE project.
+
+```{r}
+#removing the tags for animals we know were exposed to sonar
+DDCs<-ddata1[ddata1$sonar!="sonar",]
+```
+
+Since we will treat tags, not deep dive cycles, as the independent sampling units, we aggregate the deep dive cycle data for each tag into a single tag record (object `tags`) 
+
+```{r}
+# Creating the data per tag
+tags <- DDCs %>%
+  group_by(tag) %>% 
+  summarise(location=unique(location), year=unique(year), sex=unique(sex),
+  duration= sum(durations,na.rm=T),nclicks=sum(nclick,na.rm=T),
+  crate=sum(nclick,na.rm=T)/sum(durations,na.rm=T),ddc=max(absdives+1,na.rm = T))
+#recoding "Norway Andenes" as just Norway
+tags$location[tags$location=="Norway Andenes"] <- "Norway"
+```
+
+```{r, exportsummarylist, echo = FALSE}
+#exporting this as a summary list of tags used in the paper, in case that is useful
+write.table(tags,file="ListOfTagsUsed.txt")
+```
+
+
+# Exploratory data analysis
+
+We have a total of `r nrow(tags)` whales tagged which were not, knowingly, exposed to sonar.
+
+Tag recording duration ranged from `r round(min(tags$duration)/(60*60),3)` to `r round(max(tags$duration)/(60*60),3)` hours. The observed cue rates per tag varied between `r round(min(tags$crate),3)` and `r round(max(tags$crate),3)` clicks per second, with a mean value of `r round(mean(tags$crate),3)` and  median value of `r round(median(tags$crate),3)` clicks per second.  The individual cue rates per tag record, pooled across years and locations, are shown in the following figure:
+
+```{r,fig.cap="This corresponds to Figure 1 in the main paper"}
+ggplot(tags,aes(x=1,y=crate),fill="lightblue")+
+theme(axis.ticks.x=element_blank(),axis.text.x=element_blank())+geom_violin(fill="lightblue")+
+geom_jitter(width=0.03)+ylab("cue rate (clicks per second)")+xlab("")
+```
+
+Below we present a table with the locations and years covered by these tags:
+
+```{r}
+kable(table(tags$location,tags$year))
+```
+
+The number of tags per year-location combination varies considerably. Out of a total of `r length(unique(tags$location))` different locations and `r length(unique(tags$year))` different years, leading therefore to `r length(unique(tags$location))*length(unique(tags$year))` possible year-location combinations, tags are not available for the majority of these possible combinations (`r table(table(tags$location,tags$year))[1]` combinations), with only `r sum(table(table(tags$location,tags$year))[-1])` combinations having any tags associated with. 
+
+What might be the number of tag records required to obtain a reliable year-location cue rate estimate remains hard to evaluate, but several year-location combinations are certainly below that minimum, namely for those with less than a handful of tags. The distribution of the number of tags per year-location combination for which we have tags is represented in the image below:
+
+```{r}
+#note the need to remove the first count
+#corresponding to un-interesting year-location combinations
+#with 0 tags
+counts<-table(tags$location,tags$year)
+maxtags<-max(table(tags$location,tags$year))
+counts2<-numeric(maxtags)
+for (i in 1:maxtags){
+  counts2[i]<-sum(counts==i)
+}
+barplot(counts2,names.arg=1:maxtags,ylab="Number of year-location combinations",xlab="Number of tags")
+```
+
+We can take a look at the cue rates (pooled across locations) per year
+
+```{r}
+with(tags,boxplot(crate~year,ylab="Cue rate (clicks/sec)",xlab="",cex.lab=0.8,cex.axis=0.8))
+```
+
+and those (pooled across years) per location
+
+```{r}
+par(mar=c(8,4,0.2,0.2))
+with(tags,boxplot(crate~location,las=2,ylab="Cue rate (clicks/sec)",xlab="",cex.lab=0.8,cex.axis=0.8))
+```
+
+We are hoping to explain variability in cue rates as a function of year and location. To do so, year-location combinations with a small number of tags are difficult to deal with. In particular, for those with a single tag, a year-location effect would be hard to estimate: with a model with an interaction, the effect would be strictly unidentifiable. We therefore removed years and locations for which only a single tag existed, effectively removing the single tag from Norway Andenes, which was also the only tag from 2005. Additionally, we pooled tags from single-tag year-location combinations into an adjacent year for the same same location. Hence, we pooled
+
+* the single tag from Norway in 2009 with the 3 Norway tags from 2010;
+* the single tag from Dominica in 2017 with the remaining 4 Dominica tags from 2016;
+* the single tag from the Mediterranean in 2001 with the 7 tags from Mediterranean from 2003.
+
+```{r}
+# removing the location with a single tag
+# tags<-tags[tags$location!="Norway Andenes",]
+# grouping single tag per year into adjacent years
+tags$year[tags$location=="Norway" & tags$year==2009]<- 2010
+tags$year[tags$location=="Dominica" & tags$year==2017]<- 2016
+tags$year[tags$location=="Mediterranean" & tags$year==2001]<- 2003
+```
+
+After this assignment, we created a couple of factor covariates inside `tags`:
+
+* `fyear`, representing year as a factor
+* `locyear`, representing each year-location as a factor
+
+```{r}
+#building relevant factor covariates given this new assignment
+#making a new variable, year as factor
+tags$fyear<-as.factor(tags$year)
+#adding a variable that represents each location-year combination
+tags$locyear<-as.factor(paste0(tags$location,tags$fyear))
+#and also explicitly code location as a factor
+tags$location<-factor(tags$location)
+```
+
+Given this data pooling, the above plots become:
+
+```{r}
+par(mfrow=c(2,1),mar=c(4,4,0.2,0.2))
+with(tags,boxplot(crate~year,ylab="Cue rate (clicks/sec)",xlab="",cex.lab=0.8,cex.axis=0.8))
+par(mar=c(8,4,0.2,0.2))
+with(tags,boxplot(crate~location,las=2,ylab="Cue rate (clicks/sec)",xlab="",cex.lab=0.8,cex.axis=0.8))
+```
+
+# Estimating cue rates
+
+Our objective is to obtain a cue rate estimate, and its desired precision to include in a cue counting density estimator. We assume cue rate might depend on a number of covariates, for which location and year might act as relevant proxies.
+
+After this we will look at whether some animal specific covariates might be relevant to explain cue rates.
+
+## Considering Year and Location
+
+Ignoring what required predictions might be to begin with, from first principles, location might be a sensible fixed effects covariate, since different locations will present different depths and prey distributions, and hence foraging at different depths might occur, and consequently different cue rates per location (across years). On the other hand, it seems like the variability from year might be not driven by year itself, but as random fluctuations over time, perhaps more sensibly accounted for as a factor (or a random effect). If one believes this to be the case, to predict cue rates for:
+
+1. a sampled location and a new year, one could consider to use a model with location as a fixed effect, propagating the variability of year as a random effect;
+2. for a new location and year, one could would use a model with both location and year as random effects.
+
+In other words, intuitively year seems more sensibly modeled as a random effect, while location could be modeled either as as a fixed effect or as a random effect.
+
+We can distinguish different levels of difficulty in terms of cue rate estimation with regards to the available information to do so. From easiest to hardest, we might want to estimate a cue rate for:
+
+* a year-location combination we have data for;
+* a location we have data for at a year we do not have data for;
+* a year we have data for at a location we do not have data for;
+* a completely new year-location combination.
+
+From a conceptual point of view, if we had enough data across years and locations, one might want to:
+
+1. treat as fixed effects those covariates for which we observed the level for which predictions are desired, but 
+2. treat as random effects those covariates for which the level at which we would like to predict were not observed
+
+When considering a model with random effect(s) care must be had to propagate into predictions the variability associated with predicting for a new, previously unobserved, level of the random effect. As will be described below, this is not necessarily straightforward, and different alternatives are available to do so.
+
+Note we will not be able to separate the effect of year and location for Kaikoura, since this location was only sampled in 2013, and no other location was sampled in that year. Additionally, we cannot separate effects for years 2020 and 2021 as we only have tags from a single site (the Azores) in those years.
+
+A precautionary approach, when predicting a cue rate for new year and location combinations, might be to use both year and location as random effects in a random effects model and then propagate the uncertainty associated with the overall mean with respect to both random effects, year and location, that would be unobserved.
+
+We can think of a few different ways to conceptualize the random effects. These include:
+
+* Independent random effects for year and location
+* A single random effect associated with each location-year combination
+* A random effect associated with location and a nested-within-location random effect associated with year. This means that effect of location is shared across years, but the effect of year is not shared across locations
+
+Below we will consider Bayesian implementations of [Nimble](#ilinkGLMMlyreNimble) to fit the models with random effects and propagate the uncertainty of unobserved random effect levels to predictions, but in https://github.com/TiagoAMarques/Report4BB there are other implementations, including in a frequentist framework.
+
+### Model fitting
+
+We will assume that cue rates, a strictly positive quantity, follow a Gamma distribution, and a log-link function will be considered within a generalized linear model (GLM) or generalized linear mixed model (GLMM) to ensure only admissible, i.e. positive, predictions.
+
+#### GLMs
+
+We begin by looking at GLM models where both location and year are treated as fixed effects including or not interaction terms between year and location. While for preliminary analysis we considered year as a numerical covariate, we then decided that there was no temporal trend expected, and hence year was more sensibly included as a factor. The use of year as a factor seems more sensible $a~priori$, as noted above. On the other hand, even if it were a real effect, the interaction would be almost impossible to evaluate/support with the available data, given there are very few year-location combinations for which such an interaction term could be estimated.
+
+```{r,cache=FALSE}
+#run models
+CRglm0<-glm(crate~1,data=tags,family=Gamma(link="log"))
+CRglmL<-glm(crate~location,data=tags,family=Gamma(link="log"))
+CRglmfY<-glm(crate~fyear,data=tags,family=Gamma(link="log"))
+CRglm3<-glm(crate~location+fyear,data=tags,family=Gamma(link="log"))
+CRglm4<-glm(crate~location+fyear+fyear:location,data=tags,family=Gamma(link="log"))
+```
+
+```{r,cache=FALSE}
+AICtable <- cbind(data.frame(terms=c("~1","location","fyear","location+fyear","location*fyear")),AIC(CRglm0,CRglmL,CRglmfY,CRglm3,CRglm4))
+AICtable$deltaAIC <- AICtable$AIC-min(AICtable$AIC)
+AICtable <- AICtable[order(AICtable$deltaAIC),]
+kable(AICtable,caption="Diferent GLMs considered to model the cue rate data")
+```
+
+According to AIC the best model considers only location as a factor, while year and the interaction between these factors is not deemed relevant. We can look at the summary of said model
+
+```{r}
+summary(CRglmL)
+```
+
+We illustrate how to estimate the cue rate, and its precision, for all year-location combinations for which we have more than 3 tags. The choice of 3 is arbitrary, but we considered that 3 or less tags would be unreliable.
+
+We present empirical estimates (i.e. cue rate means for tags from a given year and site combinations) and estimates based on the GLM model. Note that these are not necessarily the same as empirical estimates use the data for a given year site combination, since the GLM estimates only use the predictions based on a fixed effect location. The predictions would only be the same if we used a model with a location-year interaction term.
+
+```{r}
+# create all possible unique location-year combinations
+all.comb<-expand.grid(location=sort(unique(tags$location)),year=sort(unique(tags$year)))
+
+# select only those year-location combinations for which we have tags
+index.min<-which(table(tags$location,tags$year)!=0)
+# create an object to hold all possible location-year's independent of the number of tags (1 is enough to be in)
+byly.all <- all.comb[index.min,]
+
+# define minimum number of tags required to produce an estimate
+nmin<-3
+# select only those
+index.min<-which(table(tags$location,tags$year)>nmin)
+# create an object to hold results by location-year
+# all.comb was created way above!
+byly <- all.comb[index.min,]
+
+#now, for each combination
+for(i in 1:nrow(byly)){
+  index <- tags$location==byly$location[i] & tags$year==byly$year[i]
+  #-----------------------------------------------------------------
+  #get the empirical average cue rate estimate
+  #-----------------------------------------------------------------
+  #get the actual number of tags
+  byly$ntags[i] <- sum(index)
+  #calculate empirical cue rate
+  byly$ecr[i] <- mean(tags$crate[index])
+  #calculate empirical standard deviation
+  byly$ecrsd[i] <- sd(tags$crate[index])
+  #and the margin for a confidence interval
+  byly$margin.ecr[i] <- qt(0.975,byly$ntags[i]-1)*byly$ecrsd[i]/sqrt(byly$ntags[i])
+  # get the empirical lower and upper 95% CI
+  byly$lcl.ecr <- with(byly,ecr - margin.ecr)
+  byly$ucl.ecr <- with(byly,ecr + margin.ecr)
+}
+# get the glm estimate
+temp1 <- predict(CRglm3,newdata = data.frame(location=byly$location,fyear=as.character(byly$year)),type="response",se=TRUE)
+temp2 <- predict(CRglmL,newdata = data.frame(location=byly$location),type="response",se=TRUE)
+# get the point estimates
+byly$glm.cr1 <- temp1$fit
+byly$glm.cr2 <- temp2$fit
+# get the ci's
+byly$glm.lci.cr1 <- temp1$fit - qt(0.975,summary(CRglm3)$df.residual)*temp1$se
+byly$glm.uci.cr1 <- temp1$fit + qt(0.975,summary(CRglm3)$df.residual)*temp1$se
+# get the ci's
+byly$glm.lci.cr2 <- temp2$fit - qt(0.975,summary(CRglmL)$df.residual)*temp2$se
+byly$glm.uci.cr2 <- temp2$fit + qt(0.975,summary(CRglmL)$df.residual)*temp2$se
+```
+
+We compare below standard averages (left) against values obtained from the glms (right, just location and left, location + year) for year-site combinations with more than `r nmin` tags in terms of both point estimates (black points) and confidence intervals (solid vertical black lines). In between each such pair of estimates we added the number of tags available for each year-location combination.
+
+```{r, fig.cap="This corresponds to figure 2 in the main paper"}
+#sort by location, then date
+byly <- byly[order(byly$location,byly$year),]
+#standard average
+par(mfrow=c(1,1),mar=c(6,4,0.1,0.4))
+plot(x=(1:nrow(byly))-0.2,y=byly$ecr,xaxt="n",ylim=c(0,1.6),xlim=c(0.5,nrow(byly)+0.5),xlab="",ylab="cue rate (clicks per second)")
+with(byly,segments(x0=(1:nrow(byly))-0.2,x1=(1:nrow(byly))-0.2,y0=lcl.ecr,y1=ucl.ecr))
+#GLMs
+points(x=(1:nrow(byly))+0.2,y=byly$glm.cr1)
+points(x=(1:nrow(byly))+0.1,y=byly$glm.cr2)
+with(byly,segments(x0=(1:nrow(byly))+0.2,x1=(1:nrow(byly))+0.2,y0=glm.lci.cr1,y1=glm.uci.cr1))
+with(byly,segments(x0=(1:nrow(byly))+0.1,x1=(1:nrow(byly))+0.1,y0=glm.lci.cr2,y1=glm.uci.cr2))
+#draw axis and annotations
+#axis(1, at=(1:nrow(byly))-0.2,byly$location,cex.axis=0.6,las=2)
+axis(1, at=(1:nrow(byly)),byly$year,tick=FALSE,cex.axis=1,las=2,line=0)
+text(x=(1:nrow(byly)),y=0,labels=byly$ntags,cex=1)
+abline(v=c(4.5,8.5,11.5,12.5,13.5,14.5),lty=2)
+myat <- 1.50
+text(2.5,myat,"Azores")
+text(6.5,myat,"Dominica")
+text(10,myat,"GoM")
+text(12,myat,"Kaikora",srt=90)
+text(13,myat,"Mediterranean",srt=90)
+text(14,myat,"Delaware",srt=90)
+text(15,myat,"Norway",srt=90)
+```
+
+For easier reading and for possible use elsewhere, we also present these values in a table:
+
+```{r}
+byly$crcv<-100*byly$ecrsd/byly$ecr
+kable(byly,digits = 3)
+```
+
+These estimates illustrate that point estimates are not that different from each other using either means or the GLM, with considerable overlap in confidence intervals across year site combinations. In terms of cue rates, most location-year combinations are relatively consistent, with notable exceptions for the GoM in 2002, with higher estimated cue rate, and the Azores in 2020, with a considerably lower estimated cue rate.
+
+Interestingly, the estimates from the GLM are similar or even slightly less precise then those from standard means, with notable exceptions being the most variable year-location combinations, where the `glm` returned narrower confidence intervals, namely for the GoM in 2001, Norway in 2010 and Dominica in 2016, where the strength borrowed from all the tags analysis means the model-based estimate is considerably more precise.
+
+The GLM vs. empirical average comparison also illustrates how a naive cue rate confidence interval drawn from a reduced number of tags could result in inadmissible estimates for the latter (the naive 95% CI for the GoM in 2001 approaches 0, while negative values for the cue rate are not possible). From that perspective, estimates from the fitted model might be better, as these will avoid negative values by construction, induced by the log link.
+
+#### GLMMs
+
+##### Using lme4
+
+Here we implemented 3 different GLMM models, with a different random effect structure:
+
+1. Location and Year as independent random effects
+2. Year random effect nested in location random effect
+3. Year-location combo single random effect
+
+This is implemented here:
+
+```{r,runglmer}
+# a model that considers each of year and location to be fully crossed and 
+#independent random effects
+crglmer<-glmer(crate~(1|location)+(1|fyear),data=tags,family=Gamma(link="log"))
+# a Pooled model not separating the effect of year and location
+# so each year location combination is its own random effect level
+# equates to saying there's no site effect not year effect
+crglmerP<-glmer(crate~(1|locyear),data=tags,family=Gamma(link="log"))
+# Random effect of year nested in location
+crglmerN<-glmer(crate~(1|location/fyear),data=tags,family=Gamma(link="log"))  
+```
+
+Interestingly, AIC - which might not be the best way to choose from different random effect stuctures - seems to favour the model where each year-site combination is a different level of a single year-site random effect.
+
+```{r}
+kable(AIC(crglmer,crglmerP,crglmerN))
+```
+
+It becomes an open question for now whether, to predict for a new location-year combination, one should consider the precision of this overall mean, or the precision associated with a new location-year mean (the classical difference between prediction intervals, for a new observation, and confidence intervals, for the mean). Here I am working on the latter, harder to estimate, although one might argue the former, much easier to estimate, might be appropriate.
+
+To do so we need to propagate the variability associated with the random effects into the point estimate of the intercept of the model. This is not necessarily a straightforward thing to do.
+
+Here we implement the GLMM model within a Bayesian context, choosing NIMBLE for implementation (<https://r-nimble.org/>). NIMBLE adopts and extends BUGS as a modeling language and lets you program with the models you create.
+
+##### Location and Year as independent random effects
+
+First we define the Nimble model:
+
+```{r,nimblemodel}
+## define the model
+GLMMcode <- nimbleCode({
+  # define priors
+  # the overall intercept
+  beta0 ~ dnorm(0, sd = 10)
+  # random effect standard deviation associated with location, a uniform, might change this to be something else latter
+  sigmal_RE ~ dunif(0,10)
+  # random effect standard deviation associated with year, a uniform, might change this to be something else latter
+  sigmay_RE ~ dunif(0, 10)
+  # the gamma dispersion (or variance - see commented parametrization 1) parameter, a uniform, might change this to be something else latter
+  #dispersion ~ dunif(0, 10)
+  disp ~ dunif(0, 10)
+  ## sd ~ dhalfflat()
+  #get year random effects
+  for(yy in 1:nyears){
+    #REy[yy] ~ dnorm(0, sd = sigmay_RE)
+    REy[yy] ~ dnorm(0, sd = sigmay_RE)
+  }  
+  #get location random effects
+  for(ll in 1:nlocs){
+    #REl[ll] ~ dnorm(0, sd = sigmal_RE)
+    REl[ll] ~ dnorm(0, sd = sigmal_RE)
+  }  
+  for (i in 1:N){
+    #get the linear predictor, consider a log link function
+    log(mean[i]) <- beta0 + REy[year[i]] + REl[loc[i]]
+    # now Using decentered parametrization, a suggestion by Ben Augustine
+    # log(mean[i]) <- beta0 + REy[year[i]]*sigmay_RE + REl[loc[i]]*sigmal_RE
+    # parametrization 1 - now I know that to not be what is to be used
+    #left here for future reference
+    # crate[i] ~ dgamma(shape=(mean[i]^2)/disp,scale=disp/mean[i])
+    #parametrization 2
+    crate[i] ~ dgamma(shape=1/disp, scale=mean[i]*disp)
+  }
+})
+
+```
+
+And then we define the required constants, data, and initial values, as well as the nodes to monitor in the MCMC
+
+```{r,nimblepars}
+## constants, data, and initial values
+
+#constant, sample size and number of levels for each of the random effects
+#number of rows in tags
+N<-nrow(tags)
+#number of different years
+nyears <- length(unique(tags$year))
+#number of different locations
+nlocs <- length(unique(tags$location))
+#the year covariate is passed as a constant
+year <- as.numeric(tags$fyear)
+#the location covaraite is passed as a constant
+loc <- as.numeric(tags$location)
+#bundle all in a suitable object
+constants <- list(N = N,nyears=nyears,nlocs=nlocs,year = year,loc = loc)
+
+#data
+data <- list(crate = tags$crate)
+
+#initial values
+#inits <- list(beta0 = 0, sigmal_RE = 1, sigmay_RE = 1, dispersion = 0.8,REy = rep(0,nyears),REl = rep(0,nlocs))
+inits <- list(beta0 = 0, sigmal_RE = 1, sigmay_RE = 1, disp = 1,REy = rep(0,nyears),REl = rep(0,nlocs))
+```
+
+
+```{r,createmodel}
+## create the model object
+myGLMMModel <- nimbleModel(code = GLMMcode, constants = constants, data = data, 
+                       inits = inits, check = FALSE, buildDerivs = TRUE) ## Add buildDerivs = TRUE for AD
+cmyGLMMModel <- compileNimble(myGLMMModel)
+```
+
+```{r,parstomonitor}
+#things to monitor
+#tomon<-c("beta0","dispersion","sigmay_RE","sigmal_RE","crate","REy","REl")
+tomon<-c("beta0","disp","sigmay_RE","sigmal_RE","REy","REl")
+```
+
+Then we run the code, considering 50000 iterations with a 10000 iterations burnin period, leaving 40000 iterations for inference.
+
+```{r,nimblerun}
+test<-nimbleMCMC(myGLMMModel,monitors=tomon,niter=50000,nburnin=10000,progressBar=TRUE,summary=TRUE)
+```
+
+There were no apparent issues with convergence/mixing of MCMC chains
+
+```{r}
+par(mfrow=c(2,2))
+#trace plot intercept
+plot(test$samples[,20],pch=".",ylab="intecept")
+#trace plot dispersion
+plot(test$samples[,nrow(test$summary)],pch=".",ylab="dispersion")
+#trace plot year random effect standard deviation
+plot(test$samples[,nrow(test$summary)-2],pch=".",ylab="location random effect sigma")
+#trace plot location random effect standard deviation
+plot(test$samples[,nrow(test$summary)-1],pch=".",ylab="year random effect sigma")
+```
+
+We can look at the main results, i.e. all top-level stochastic nodes of the model, namely the intercept, the dispersion parameter for the Gamma and the standard deviations of both random effects
+
+```{r}
+#look at main results
+kable(test$summary,digits=2)
+```
+
+```{r}
+# getting the overall estimate for a new year and location and respective CI's we are looking for
+# heuristically appealing but... is this kosher?
+nsamples<-nrow(test$samples)
+myquants95CI.Bayes<-quantile(exp(test$samples[,which(rownames(test$summary)=="beta0")]+rnorm(nsamples,mean=0,sd=test$samples[,which(rownames(test$summary)=="sigmal_RE")])+rnorm(nsamples,mean=0,sd=test$samples[,which(rownames(test$summary)=="sigmay_RE")])),probs=c(0.025,0.5,0.975))
+myquants95CI.Bayes
+```
+
+##### Year random effect nested in location random effect
+
+First we define the Nimble model:
+
+```{r,nimblemodelynl}
+## define the model
+GLMMcodeYnL <- nimbleCode({
+  # the overall intercept
+  beta0 ~ dnorm(0, sd = 10)
+  # random effect standard deviation associated with location, a uniform, might change this to be something else latter
+  sigmal_RE ~ dunif(0,10)
+  # random effect standard deviation associated with year, nested in location, a uniform, might change this to be something else latter
+  sigmaynl_RE ~ dunif(0, 10)
+  # the gamma dispersion (or variance - see commented parametrization 1) parameter, a uniform, might change this to be something else latter
+  #dispersion ~ dunif(0, 10)
+  disp ~ dunif(0, 10)
+   #get year random effects, nested in locations (i.e. more levels than just years)
+  for(yy in 1:nyearsnl){
+    REynl[yy] ~ dnorm(0, sd = sigmaynl_RE)
+  }  
+  #get location random effects
+  for(ll in 1:nlocs){
+    REl[ll] ~ dnorm(0, sd = sigmal_RE)
+  }  
+  for (i in 1:N){
+    #get the linear predictor, consider a log link function
+    log(mean[i]) <- beta0 + REynl[yearnl[i]] + REl[loc[i]]
+    #on the response scale
+    crate[i] ~ dgamma(shape=1/disp, scale=mean[i]*disp)
+  }
+})
+```
+
+And then we define the required constants, data, and initial values, as well as the nodes to monitor in the MCMC
+
+```{r,nimbleparsynl}
+## constants, data, and initial values
+
+#constant, sample size and number of levels for each of the random effects
+#number of rows in tags
+N<-nrow(tags)
+#number of different years nested in locations (= number of location year combinations)
+nyearsnl <- length(unique(tags$locyear))
+#number of different locations
+nlocs <- length(unique(tags$location))
+#the year within loc covariate is passed as a constant
+yearnl <- as.numeric(tags$locyear)
+#the location covaraite is passed as a constant
+loc <- as.numeric(tags$location)
+#bundle all in a suitable object
+constants <- list(N = N,nyearsnl=nyearsnl,nlocs=nlocs,yearnl = yearnl,loc = loc)
+
+#data
+data <- list(crate = tags$crate)
+
+#initial values
+#inits <- list(beta0 = 0, sigmal_RE = 1, sigmay_RE = 1, dispersion = 0.8,REy = rep(0,nyears),REl = rep(0,nlocs))
+inits <- list(beta0 = 0, sigmal_RE = 1, sigmaynl_RE = 1, disp = 1,REynl = rep(0,nyearsnl),REl = rep(0,nlocs))
+```
+
+
+```{r,createmodelynl}
+## create the model object
+myGLMMModelynl <- nimbleModel(code = GLMMcodeYnL, constants = constants, data = data, 
+                       inits = inits, check = FALSE, buildDerivs = TRUE) ## Add buildDerivs = TRUE for AD
+cmyGLMMModelynl <- compileNimble(myGLMMModelynl)
+```
+
+```{r,parstomonitorynl}
+#things to monitor
+tomonynl<-c("beta0","disp","sigmaynl_RE","sigmal_RE","REynl","REl")
+```
+
+Then we run the code, considering 55000 iterations with a 15000 iterations burnin period, leaving 40000 iterations for inference.
+
+```{r,nimblerunynl}
+testynl<-nimbleMCMC(myGLMMModelynl,monitors=tomonynl,niter=55000,nburnin=15000,progressBar=TRUE,summary=TRUE)
+```
+
+There were no apparent issues with convergence/mixing of MCMC chains
+
+```{r}
+par(mfrow=c(2,2))
+#trace plot intercept
+plot(testynl$samples[,which(rownames(testynl$summary)=="beta0")],pch=".",ylab="intecept")
+#trace plot dispersion
+plot(testynl$samples[,which(rownames(testynl$summary)=="disp")],pch=".",ylab="dispersion")
+#trace plot location random effect standard deviation
+plot(testynl$samples[,which(rownames(testynl$summary)=="sigmal_RE")],pch=".",ylab="location random effect sigma")
+#trace plot year random effect standard deviation
+plot(testynl$samples[,which(rownames(testynl$summary)=="sigmaynl_RE")],pch=".",ylab="year (nested in location) random effect sigma")
+```
+
+We can look at the main results, i.e. all top-level stochastic nodes of the model, namely the intercept, the dispersion parameter and the standard deviations of the random effects
+
+```{r}
+#look at main results - 
+testynl$summary
+```
+
+We can see posterior distributions
+
+```{r}
+par(mfrow=c(2,2))
+#posterior plot intercept
+intercepts<-testynl$samples[,which(rownames(testynl$summary)=="beta0")]
+hist(intercepts,pch=".",xlab="intecept",main="")
+abline(v=quantile(intercepts,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(intercepts),col="orange",lty=2)
+#posterior plot dispersion
+dispersions<-testynl$samples[,which(rownames(testynl$summary)=="disp")]
+hist(dispersions,pch=".",xlab="dispersion",main="")
+abline(v=quantile(dispersions,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(dispersions),col="orange",lty=2)
+#posterior plot location random effect standard deviation
+lsigmas<-testynl$samples[,which(rownames(testynl$summary)=="sigmal_RE")]
+hist(lsigmas,pch=".",xlab="location random effect sigma",main="")
+abline(v=quantile(lsigmas,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(lsigmas),col="orange",lty=2)
+#posterior plot year random effect standard deviation
+ynlsigmas<-testynl$samples[,which(rownames(testynl$summary)=="sigmaynl_RE")]
+hist(ynlsigmas,pch=".",xlab="year random effect sigma",main="")
+abline(v=quantile(ynlsigmas,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(ynlsigmas),col="orange",lty=2)
+```
+
+Assuming that the MCMC approach, which does not use any approximations, is the one most reliable, we would finally obtain the variability around the mean by simulating from the relevant posterior distributions
+
+```{r}
+# getting the overall estimate for a new year and location and respective CI's we are looking for
+# heuristically appealing but... is this kosher?
+nsample.ynls<-nrow(testynl$samples)
+myquants95CI.Bayes.ynl<-quantile(exp(testynl$samples[,which(rownames(testynl$summary)=="beta0")]+rnorm(nsamples,mean=0,sd=testynl$samples[,which(rownames(testynl$summary)=="sigmal_RE")])+rnorm(nsamples,mean=0,sd=testynl$samples[,which(rownames(testynl$summary)=="sigmaynl_RE")])),probs=c(0.025,0.5,0.975))
+```
+
+##### Year-location combo single random effect
+
+First we define the Nimble model:
+
+```{r,nimblemodel1re}
+## define the model
+GLMMcode1re <- nimbleCode({
+  # the overall intercept
+  beta0 ~ dnorm(0, sd = 10)
+  # random effect standard deviation associated with locatio-year, a uniform, might change this to be something else latter
+  sigma1re_RE ~ dunif(0,10)
+  # the gamma dispersion (or variance - see commented parametrization 1) parameter, a uniform, might change this to be something else latter
+  #dispersion ~ dunif(0, 10)
+  disp ~ dunif(0, 10)
+   #get year random effects
+  for(yy in 1:nyearsnl){
+    RE1re[yy] ~ dnorm(0, sd = sigma1re_RE)
+  }  
+  for (i in 1:N){
+    #get the linear predictor, consider a log link function
+    log(mean[i]) <- beta0 + RE1re[yearnl[i]]
+    #on the response scale
+    crate[i] ~ dgamma(shape=1/disp, scale=mean[i]*disp)
+  }
+})
+```
+
+And then we define the required constants, data, and initial values, as well as the nodes to monitor in the MCMC
+
+```{r,nimblepars1re}
+## constants, data, and initial values
+
+#constant, sample size and number of levels for each of the random effects
+#number of rows in tags
+N<-nrow(tags)
+#number of different years nested in locations (= number of location year combinations)
+nyearsnl <- length(unique(tags$locyear))
+#the year within loc covariate is passed as a constant
+yearnl <- as.numeric(tags$locyear)
+#bundle all in a suitable object
+constants1re <- list(N = N,nyearsnl=nyearsnl,yearnl = yearnl)
+#data
+data <- list(crate = tags$crate)
+
+#initial values
+inits1re <- list(beta0 = 0, sigma1re_RE = 1, disp = 1,RE1re = rep(0,nyearsnl))
+```
+
+
+```{r,createmodel1re}
+## create the model object
+myGLMMModel1re <- nimbleModel(code = GLMMcode1re, constants = constants1re, data = data, 
+                       inits = inits1re, check = FALSE, buildDerivs = TRUE) ## Add buildDerivs = TRUE for AD
+cmyGLMMModel1re <- compileNimble(myGLMMModel1re)
+```
+
+```{r,parstomonitor1re}
+#things to monitor
+tomon1re<-c("beta0","disp","sigma1re_RE","RE1re")
+```
+
+Then we run the code, considering 50000 iterations with a 15000 iterations burnin period, leaving 40000 iterations for inference.
+
+```{r,nimblerun1re}
+test1re<-nimbleMCMC(myGLMMModel1re,monitors=tomon1re,niter=55000,nburnin=15000,progressBar=TRUE,summary=TRUE)
+```
+
+There were no apparent issues with convergence/mixing of MCMC chains
+
+```{r}
+par(mfrow=c(1,3))
+#trace plot intercept
+plot(test1re$samples[,which(rownames(test1re$summary)=="beta0")],pch=".",ylab="intecept")
+#trace plot dispersion
+plot(test1re$samples[,which(rownames(test1re$summary)=="disp")],pch=".",ylab="dispersion")
+#trace plot location random effect standard deviation
+plot(test1re$samples[,which(rownames(test1re$summary)=="sigma1re_RE")],pch=".",ylab="location-year random effect sigma")
+```
+
+We can look at the main results, i.e. all top-level stochastic nodes of the model, namely the intercept, the dispersion parameter and the standard deviations of the random effects
+
+```{r}
+#look at main results - 
+test1re$summary
+```
+
+We can see posterior distributions
+
+```{r}
+par(mfrow=c(1,3))
+#posterior plot intercept
+intercepts<-test1re$samples[,which(rownames(test1re$summary)=="beta0")]
+hist(intercepts,pch=".",xlab="intecept",main="")
+abline(v=quantile(intercepts,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(intercepts),col="orange",lty=2)
+#posterior plot dispersion
+dispersions<-test1re$samples[,which(rownames(test1re$summary)=="disp")]
+hist(dispersions,pch=".",xlab="dispersion",main="")
+abline(v=quantile(dispersions,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(dispersions),col="orange",lty=2)
+#posterior plot location random effect standard deviation
+lysigmas<-test1re$samples[,which(rownames(test1re$summary)=="sigma1re_RE")]
+hist(lysigmas,pch=".",xlab="location-year random effect sigma",main="")
+abline(v=quantile(lysigmas,probs=c(0.025,0.5,0.975)),col="orange",lty=2)
+abline(v=mean(lysigmas),col="orange",lty=2)
+```
+
+Assuming that the MCMC approach, which does not use any approximations, is the one most reliable, we would finally obtain the variability around the mean by simulating from the relevant posterior distributions
+
+```{r}
+# getting the overall estimate for a new year and location and respective CI's we are looking for
+# heuristically appealing but... is this kosher?
+nsample.1re<-nrow(test1re$samples)
+myquants95CI.Bayes.1re<-quantile(exp(test1re$samples[,which(rownames(test1re$summary)=="beta0")]+rnorm(nsample.1re,mean=0,sd=test1re$samples[,which(rownames(test1re$summary)=="sigma1re_RE")])),probs=c(0.025,0.5,0.975))
+```
+
+##### Comparison of random effect stuctures
+
+Considering two independent random effects for year and location, the mean cue rate would be estimated at `r round(mean(exp(test$samples[,which(rownames(test$summary)=="beta0")])),2)` (median: `r round(quantile(myquants95CI.Bayes,probs=0.5),2)`, 95% credible interval `r round(quantile(myquants95CI.Bayes,probs=0.025),2)`-`r round(quantile(myquants95CI.Bayes,probs=0.975),2)`). This corresponds to a CV of `r round(100*sd(myquants95CI.Bayes)/mean(myquants95CI.Bayes),2)`.
+
+
+Considering year nested within location for the random effect structure, the mean cue rate would be estimated at `r round(mean(exp(testynl$samples[,which(rownames(testynl$summary)=="beta0")])),2)` (median: `r round(quantile(myquants95CI.Bayes.ynl,probs=0.5),2)`, 95% credible interval `r round(quantile(myquants95CI.Bayes.ynl,probs=0.025),2)`-`r round(quantile(myquants95CI.Bayes.ynl,probs=0.975),2)`). This corresponds to a CV of `r round(100*sd(myquants95CI.Bayes.ynl)/mean(myquants95CI.Bayes.ynl),2)`.
+
+Considering a single year-location combination as random effect structure, the mean cue rate would be estimated at `r round(mean(exp(test1re$samples[,which(rownames(test1re$summary)=="beta0")])),2)` (median: `r round(quantile(myquants95CI.Bayes.1re,probs=0.5),2)`, 95% credible interval `r round(quantile(myquants95CI.Bayes.1re,probs=0.025),2)`-`r round(quantile(myquants95CI.Bayes.1re,probs=0.975),2)`). This corresponds to a CV of `r round(100*sd(myquants95CI.Bayes.1re)/mean(myquants95CI.Bayes.1re),2)`.
+
+## Animal specific covariates
+
+### Inter-Click-Interval
+
+Here we look at whether the Inter-Click-Interval (ICI) data might be used to predict cue rate.
+
+Read the click data
+
+```{r}
+#reading the clicks data
+#clall<-read.table(file="data/clall.txt")
+clall<-fread(file="data/clall.txt")
+
+nclall<-nrow(clall)
+```
+
+do a bit of data processing
+
+```{r}
+#get the ici, not last ici of each whale does not exist, so here
+#add ici of NA for the last click of the last whale
+clall$ici <- c(clall$sss[2:nclall]-clall$sss[1:(nclall-1)],NA)
+
+#index of where you change whale, so last click of a whale
+clall$cw <- c(clall$tag[2:nclall]==clall$tag[1:(nclall-1)],NA)
+#and remove those ici's, which are not interpretable as they are calculated across whales
+
+clall <- clall[clall$cw,]
+clall <- clall[-nrow(clall),]
+# calculating per whale
+# mean/median/mode ici's, with trimmed data
+
+#first, only  get regular click ICI, which implies
+#between 0.2 seconds and say 5 seconds
+clall <- clall[clall$ici>0.2 & clall$ici<5,]
+
+#a bespoke function to get a mode
+get.mode <- function(x){
+xdens = density(x)
+modex = xdens$x[which.max(xdens$y)]
+return(modex)
+}
+```
+
+Calculate summary statistics per tag
+
+```{r}
+#summarize data
+icitags<-tapply(X=clall$tag,INDEX=clall$tag,FUN=head,n=1)
+icimean<-tapply(X=clall$ici,INDEX=clall$tag,FUN=mean)
+icimean0.05<-tapply(X=clall$ici,INDEX=clall$tag,FUN=mean,trim = 0.05)
+icimean0.1<-tapply(X=clall$ici,INDEX=clall$tag,FUN=mean,trim = 0.1)
+icimedian<-tapply(X=clall$ici,INDEX=clall$tag,FUN=median)
+icimode<-tapply(X=clall$ici,INDEX=clall$tag,FUN=get.mode)
+# make a single suitable object
+ici.sums<-data.frame(tag=icitags,mean=icimean,mean0.05=icimean0.05,mean0.1=icimean0.1,median=icimedian,mode=icimode)
+#pairs(ici.sums[,-1])
+```
+
+And finally merge this information with the click rates, to be able to model click rates as a function of ICI
+
+```{r}
+tagsici<-merge(tags,ici.sums,by="tag",all.x=TRUE,all.y=FALSE)
+```
+
+We look below at linear models of click rate as a function of several statistics based on ICI's, namely:
+
+* mean ICI
+* mean ICI, trimed 0.05
+* mean ICI, trimed 0.1
+* median ICI
+* mode ICI
+
+and at the end we present a GLM model of the statistic that seems to better correlate with cue rate, which is the mean.
+
+```{r}
+par(mfrow=c(3,2))
+with(tagsici,plot(crate~mean))
+lmmean<-lm(crate~mean,data=tagsici)
+summary(lmmean)
+abline(lmmean)
+#
+with(tagsici,plot(crate~mean0.05))
+lmmean0.05<-lm(crate~mean0.05,data=tagsici)
+summary(lmmean0.05)
+abline(lmmean)
+#
+with(tagsici,plot(crate~mean0.1))
+lmmean0.1<-lm(crate~mean0.1,data=tagsici)
+summary(lmmean0.1)
+abline(lmmean)
+#
+with(tagsici,plot(crate~median))
+lmmedian<-lm(crate~median,data=tagsici)
+summary(lmmedian)
+abline(lmmedian)
+#
+with(tagsici,plot(crate~mode))
+lmmode<-lm(crate~mode,data=tagsici)
+summary(lmmode)
+abline(lmmode)
+
+with(tagsici,plot(crate~mean))
+glmmean<-glm(crate~mean,data=tagsici,family=Gamma(link="log"))
+newicis<-seq(0.4,0.9,length=100)
+preds <- predict(glmmean,newdata=data.frame(mean=newicis),type="response")
+lines(newicis,preds)
+summary(glmmean)
+```
+
+This image might be used in the paper
+
+```{r}
+par(mfrow=c(1,1))
+with(tagsici,plot(crate~mean,ylab="Click rate (clicks / second)",xlab="Mean ICI"))
+glmmean<-glm(crate~mean,data=tagsici,family=Gamma(link="log"))
+newicis<-seq(0.4,0.9,length=100)
+preds <- predict(glmmean,newdata=data.frame(mean=newicis),type="response")
+lines(newicis,preds)
+summary(glmmean)
+```
+
+```{r}
+#save file for further processing
+write.table(tagsici,file="tagsici.txt")
+```
+
+### Inter-Pulse-Interval
+
+Here we look at the Inter-Pulse-Interval (IPI) data
+
+```{r}
+#reading the IPI data
+IPIs <- read_excel("data/ACCURATE_spermwhale_sizefromIPIs.xlsx")
+#merging with the cue rate and ICI data
+tagsipi<-merge(tagsici,IPIs,by="tag",all.x=TRUE,all.y=FALSE)
+
+#not sure what this is not read as a number, forcing it so
+tagsipi$'IPI (ms)' <- as.numeric(tagsipi$'IPI (ms)')
+
+#cleaning up the data.frame which is, by now, full of garbage and repeated measurements from the multiple merges above
+tagsipi <- tagsipi[,c("tag","location.x","sex.x","year.x","duration.x","nclicks.x","crate.x","fyear","locyear","mean","mean0.05","mean0.1","median","mode",'IPI (ms)','Body length (Gordon) (m)','Body length (Growcott) (m)')]
+names(tagsipi) <- c("tag","location","sex","year","duration","nclicks","crate","fyear","locyear","mean","mean0.05","mean0.1","median","mode",'medianIPI','BLGor','BLGro')
+```
+
+and, sure enough, there also seems to be an indication that click rate decreases with size
+
+```{r}
+par(mfrow=c(1,1))
+with(tagsipi,plot(crate~BLGor,ylab="Click rate (clicks / second)",xlab="Body length (Gordon) (m)"))
+glmmeanipi<-glm(crate~BLGor,data=tagsipi,family=Gamma(link="log"))
+newBLGor<-seq(7,16,length=100)
+preds <- predict(glmmeanipi,newdata=data.frame(BLGor=newBLGor),type="response")
+lines(newBLGor,preds)
+summary(glmmeanipi)
+```
+
+How do ICI and body length relate?
+
+```{r}
+par(mfrow=c(1,1))
+with(tagsipi,plot(mean~BLGor,ylab="ICI",xlab="Body length (Gordon) (m)"))
+glmmeanipi<-glm(mean~BLGor,data=tagsipi,family=Gamma(link="log"))
+newBLGor<-seq(7,16,length=100)
+preds <- predict(glmmeanipi,newdata=data.frame(BLGor=newBLGor),type="response")
+lines(newBLGor,preds)
+summary(glmmeanipi)
+```
+
+They most certainly do, as expected. The larger the size, the larger the ICI.
+
+### Sex
+
+Naturally, if one looks at click rate per sex there is also a corresponding pattern
+
+```{r}
+with(tagsipi,boxplot(mean~sex,ylab="mean ICI"))
+```
+
+which is not surprising since cue rate, ICI and IPI/size are all related
+
+```{r}
+pairs(tagsipi[,c("crate","mean","BLGor")])
+```
+
+
+### All together now
+
+
+```{r}
+par(mfrow=c(1,1))
+glmall<-glm(crate~location+fyear+mean+sex,data=tagsipi,family=Gamma(link="log"))
+summary(glmall)
+```
+
+# Reproducing the paper tables and figures
+
+While some of the paper images were already reproduced above, in this section we show the code used to recreate all the figures in the manuscript for easier reproduction.
+
+Images are also (silently, i.e. \verb"echo=FALSE") exported as pdfs to be pasted into Word at production stage.
+
+### Figure 1
+
+```{r,fig.cap="This corresponds to Figure 1 in the main paper"}
+ggplot(tags,aes(x=1,y=crate),fill="lightblue")+
+theme(axis.ticks.x=element_blank(),axis.text.x=element_blank())+geom_violin(fill="lightblue")+
+geom_jitter(width=0.03)+ylab("cue rate (clicks per second)")+xlab("")
+```
+
+
+```{r makefigure1,echo=FALSE}
+pdf(file = "Figure1.pdf")
+ggplot(tags,aes(x=1,y=crate),fill="lightblue")+
+theme(axis.ticks.x=element_blank(),axis.text.x=element_blank())+geom_violin(fill="lightblue")+
+geom_jitter(width=0.03)+ylab("cue rate (clicks per second)")+xlab("")
+dev.off()
+```
+
+
+### Figure 2
+
+```{r, fig.cap="This corresponds to figure 2 in the main paper"}
+#sort by location, then date
+byly <- byly[order(byly$location,byly$year),]
+#standard average
+par(mfrow=c(1,1),mar=c(6,4,0.1,0.4))
+plot(x=(1:nrow(byly))-0.2,y=byly$ecr,xaxt="n",ylim=c(0,1.6),xlim=c(0.5,nrow(byly)+0.5),xlab="",ylab="cue rate (clicks per second)")
+with(byly,segments(x0=(1:nrow(byly))-0.2,x1=(1:nrow(byly))-0.2,y0=lcl.ecr,y1=ucl.ecr))
+#GLMs
+points(x=(1:nrow(byly))+0.2,y=byly$glm.cr1)
+points(x=(1:nrow(byly))+0.1,y=byly$glm.cr2)
+with(byly,segments(x0=(1:nrow(byly))+0.2,x1=(1:nrow(byly))+0.2,y0=glm.lci.cr1,y1=glm.uci.cr1))
+with(byly,segments(x0=(1:nrow(byly))+0.1,x1=(1:nrow(byly))+0.1,y0=glm.lci.cr2,y1=glm.uci.cr2))
+#draw axis and annotations
+#axis(1, at=(1:nrow(byly))-0.2,byly$location,cex.axis=0.6,las=2)
+axis(1, at=(1:nrow(byly)),byly$year,tick=FALSE,cex.axis=1,las=2,line=0)
+text(x=(1:nrow(byly)),y=0,labels=byly$ntags,cex=1)
+abline(v=c(4.5,8.5,11.5,12.5,13.5,14.5),lty=2)
+myat <- 1.50
+text(2.5,myat,"Azores")
+text(6.5,myat,"Dominica")
+text(10,myat,"Gulf of Mexico")
+text(12,myat,"Kaikora",srt=90)
+text(13,myat,"Mediterranean",srt=90)
+text(14,myat,"Delaware",srt=90)
+text(15,myat,"Norway",srt=90)
+```
+
+```{r makefigure2,echo=FALSE}
+pdf(file = "Figure2.pdf")
+#sort by location, then date
+byly <- byly[order(byly$location,byly$year),]
+#standard average
+par(mfrow=c(1,1),mar=c(6,4,0.1,0.4))
+plot(x=(1:nrow(byly))-0.2,y=byly$ecr,xaxt="n",ylim=c(0,1.6),xlim=c(0.5,nrow(byly)+0.5),xlab="",ylab="cue rate (clicks per second)")
+with(byly,segments(x0=(1:nrow(byly))-0.2,x1=(1:nrow(byly))-0.2,y0=lcl.ecr,y1=ucl.ecr))
+#GLMs
+points(x=(1:nrow(byly))+0.2,y=byly$glm.cr1)
+points(x=(1:nrow(byly))+0.1,y=byly$glm.cr2)
+with(byly,segments(x0=(1:nrow(byly))+0.2,x1=(1:nrow(byly))+0.2,y0=glm.lci.cr1,y1=glm.uci.cr1))
+with(byly,segments(x0=(1:nrow(byly))+0.1,x1=(1:nrow(byly))+0.1,y0=glm.lci.cr2,y1=glm.uci.cr2))
+#draw axis and annotations
+#axis(1, at=(1:nrow(byly))-0.2,byly$location,cex.axis=0.6,las=2)
+axis(1, at=(1:nrow(byly)),byly$year,tick=FALSE,cex.axis=1,las=2,line=0)
+text(x=(1:nrow(byly)),y=0,labels=byly$ntags,cex=1)
+abline(v=c(4.5,8.5,11.5,12.5,13.5,14.5),lty=2)
+myat <- 1.50
+text(2.5,myat,"Azores")
+text(6.5,myat,"Dominica")
+text(10,myat,"Gulf of Mexico")
+text(12,myat,"Kaikora",srt=90)
+text(13,myat,"Mediterranean",srt=90)
+text(14,myat,"Delaware",srt=90)
+text(15,myat,"Norway",srt=90)
+dev.off()
+```
+
+
+### Figure 3
+
+```{r, fig.cap="This corresponds to figure 3 in the main paper"}
+#sort by location, then date
+byly <- byly[order(byly$location,byly$year),]
+#standard average
+par(mfrow=c(1,1),mar=c(6,4,0.1,0.4))
+plot(x=(1:nrow(byly)),y=byly$ecr,xaxt="n",ylim=c(0,2),xlim=c(0.5,nrow(byly)+0.5),xlab="",ylab="cue rate (clicks per second)")
+with(byly,segments(x0=(1:nrow(byly)),x1=(1:nrow(byly)),y0=lcl.ecr,y1=ucl.ecr))
+#draw axis and annotations
+#axis(1, at=(1:nrow(byly))-0.2,byly$location,cex.axis=0.6,las=2)
+axis(1, at=(1:nrow(byly)),byly$year,tick=FALSE,cex.axis=1,las=2,line=0)
+text(x=(1:nrow(byly)),y=0,labels=byly$ntags,cex=1)
+abline(v=c(4.5,8.5,11.5,12.5,13.5,14.5),lty=2)
+myat <- 1.50
+text(2.5,myat,"Azores")
+text(6.5,myat,"Dominica")
+text(10,myat,"Gulf of Mexico")
+text(12,myat,"Kaikora",srt=90)
+text(13,myat,"Mediterranean",srt=90)
+text(14,myat,"Delaware",srt=90)
+text(15,myat,"Norway",srt=90)
+abline(h=myquants95CI.Bayes,col="cyan",lty=2,lwd=2)
+abline(h=myquants95CI.Bayes.ynl,col="lightgreen",lty=2,lwd=2)
+abline(h=myquants95CI.Bayes.1re,col="lightblue",lty=2,lwd=2)
+legend("topright",legend=c("year+location","year in location","year*location"),lty=2,lwd=c(2,2,2),col=c("cyan","lightgreen","lightblue"),inset=0.05,cex=0.8,bg="white")
+```
+
+```{r makefigure3,echo=FALSE}
+pdf(file = "Figure3.pdf")
+#sort by location, then date
+byly <- byly[order(byly$location,byly$year),]
+#standard average
+par(mfrow=c(1,1),mar=c(6,4,0.1,0.4))
+plot(x=(1:nrow(byly)),y=byly$ecr,xaxt="n",ylim=c(0,2),xlim=c(0.5,nrow(byly)+0.5),xlab="",ylab="cue rate (clicks per second)")
+with(byly,segments(x0=(1:nrow(byly)),x1=(1:nrow(byly)),y0=lcl.ecr,y1=ucl.ecr))
+#draw axis and annotations
+#axis(1, at=(1:nrow(byly))-0.2,byly$location,cex.axis=0.6,las=2)
+axis(1, at=(1:nrow(byly)),byly$year,tick=FALSE,cex.axis=1,las=2,line=0)
+text(x=(1:nrow(byly)),y=0,labels=byly$ntags,cex=1)
+abline(v=c(4.5,8.5,11.5,12.5,13.5,14.5),lty=2)
+myat <- 1.50
+text(2.5,myat,"Azores")
+text(6.5,myat,"Dominica")
+text(10,myat,"Gulf of Mexico")
+text(12,myat,"Kaikora",srt=90)
+text(13,myat,"Mediterranean",srt=90)
+text(14,myat,"Delaware",srt=90)
+text(15,myat,"Norway",srt=90)
+abline(h=myquants95CI.Bayes,col="cyan",lty=2,lwd=2)
+abline(h=myquants95CI.Bayes.ynl,col="lightgreen",lty=2,lwd=2)
+abline(h=myquants95CI.Bayes.1re,col="lightblue",lty=2,lwd=2)
+legend("topright",legend=c("year+location","year in location","year*location"),lty=2,lwd=c(2,2,2),col=c("cyan","lightgreen","lightblue"),inset=0.05,cex=0.8,bg="white")
+dev.off()
+```
+
+
+### Figure 4
+
+Below we reproduce figure 4 in the manuscript
+
+```{r, fig.cap="This corresponds to figure 4 in the main paper"}
+par(mfrow=c(2,3),mar=c(4,4,1,1))
+# click rate as a function of mean ICI
+with(tagsipi,plot(crate~mean,ylab="Click rate (clicks / second)",xlab="Mean ICI"))
+glmmean<-glm(crate~mean,data=tagsipi,family=Gamma(link="log"))
+newicis<-seq(0.4,0.9,length=100)
+preds <- predict(glmmean,newdata=data.frame(mean=newicis),type="response")
+lines(newicis,preds)
+
+# click rate as a function of median IPI
+with(tagsipi,plot(crate~medianIPI,ylab="Click rate (clicks / second)",xlab="Median IPI"))
+glmmedian<-glm(crate~medianIPI,data=tagsipi,family=Gamma(link="log"))
+newipis<-seq(2.1,7.5,length=100)
+preds <- predict(glmmedian,newdata=data.frame(medianIPI=newipis),type="response")
+lines(newipis,preds)
+# click rate as a function of animal size
+with(tagsipi,plot(crate~BLGor,ylab="Click rate (clicks / second)",xlab="Body length (Gordon) (m)"))
+glmBLGor<-glm(crate~BLGor,data=tagsipi,family=Gamma(link="log"))
+newBLGor<-seq(7,16,length=100)
+preds <- predict(glmBLGor,newdata=data.frame(BLGor=newBLGor),type="response")
+lines(newBLGor,preds)
+# relation between ICI and IPI (i.e. size)
+with(tagsipi,plot(mean~BLGor,ylab="mean ICI",xlab="Body length (Gordon) (m)"))
+glmmeansize<-glm(mean~BLGor,data=tagsipi,family=Gamma(link="log"))
+newBLGor<-seq(7,16,length=100)
+preds <- predict(glmmeansize,newdata=data.frame(BLGor=newBLGor),type="response")
+lines(newBLGor,preds)
+# ICI by sex
+with(tagsipi,boxplot(mean~sex,ylab="mean ICI",xlab="Sex"))
+# cue rate by sex
+with(tagsipi,boxplot(crate~sex,ylab="Cue rate (clicks / second)",xlab="Sex"))
+```
+
+
+```{r makefigure4,echo=FALSE}
+pdf(file = "Figure4.pdf")
+par(mfrow=c(2,3),mar=c(4,4,1,1))
+# click rate as a function of mean ICI
+with(tagsipi,plot(crate~mean,ylab="Click rate (clicks / second)",xlab="Mean ICI"))
+glmmean<-glm(crate~mean,data=tagsipi,family=Gamma(link="log"))
+newicis<-seq(0.4,0.9,length=100)
+preds <- predict(glmmean,newdata=data.frame(mean=newicis),type="response")
+lines(newicis,preds)
+
+# click rate as a function of median IPI
+with(tagsipi,plot(crate~medianIPI,ylab="Click rate (clicks / second)",xlab="Median IPI"))
+glmmedian<-glm(crate~medianIPI,data=tagsipi,family=Gamma(link="log"))
+newipis<-seq(2.1,7.5,length=100)
+preds <- predict(glmmedian,newdata=data.frame(medianIPI=newipis),type="response")
+lines(newipis,preds)
+# click rate as a function of animal size
+with(tagsipi,plot(crate~BLGor,ylab="Click rate (clicks / second)",xlab="Body length (Gordon) (m)"))
+glmBLGor<-glm(crate~BLGor,data=tagsipi,family=Gamma(link="log"))
+newBLGor<-seq(7,16,length=100)
+preds <- predict(glmBLGor,newdata=data.frame(BLGor=newBLGor),type="response")
+lines(newBLGor,preds)
+# relation between ICI and IPI (i.e. size)
+with(tagsipi,plot(mean~BLGor,ylab="mean ICI",xlab="Body length (Gordon) (m)"))
+glmmeansize<-glm(mean~BLGor,data=tagsipi,family=Gamma(link="log"))
+newBLGor<-seq(7,16,length=100)
+preds <- predict(glmmeansize,newdata=data.frame(BLGor=newBLGor),type="response")
+lines(newBLGor,preds)
+# ICI by sex
+with(tagsipi,boxplot(mean~sex,ylab="mean ICI",xlab="Sex"))
+# cue rate by sex
+with(tagsipi,boxplot(crate~sex,ylab="Cue rate (clicks / second)",xlab="Sex"))
+dev.off()
+```
+
+### Summary tables
+
+The following tables can be used to reproduce all the paper's analysis without the need for all the data wrangling that went into producing it from multiple data sources:
+
+Cue rates per tag
+
+```{r}
+kable(tagsipi[,c(1:8)],digits=2,caption="A summary table with the cue rate information")
+```
+
+ICI per tag (`mean` is the mean, `mean0.05` is the trimmed mean for 5% of the data, `mean0.1` is the trimmed mean for 10% of the data,  `median` and `mode`)
+
+```{r}
+kable(tagsipi[,c(1,2,3,4,10:14)],digits=2,caption="A summary table with the ICI information")
+```
+IPI and body sizes, per tag
+
+```{r}
+kable(tagsipi[,c(1,2,3,4,10:14)],digits=2,caption="A summary table with the cue rate IPI and animal size information")
+```
+
+All these tables merged are also exported as a single table:
+
+```{r}
+write.table(tagsipi,file="tagsipi.txt")
+```
+
+
+# Aknowledgements
+
+We thank Ben Bolker for helpful advice via the answer to our question on "Stack Exchange" at https://stats.stackexchange.com/questions/616697/how-to-estimate-precision-on-a-prediction-for-a-glmm-for-an-unobserved-level-of/. Also thanks to Ben Augustine and Perry du Valpine over email, regarding the comparison between Bayesian inferences in Nimble and `lme4`. Luca (in private) and Wei Zhang (both in private and publicly) provided helpful advice following the question on the nimble user group at https://groups.google.com/g/nimble-users/c/7UHlKdCC8B4 about the same comparison. Len Thomas provided useful discussion and advice.
+
+All errors remaining are the sole responsibility of the authors.
