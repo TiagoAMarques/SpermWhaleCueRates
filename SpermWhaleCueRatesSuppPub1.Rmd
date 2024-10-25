@@ -42,7 +42,7 @@ set.seed(2024)
 
 This document includes the code required to reproduce the analysis and resulting figures for the manuscript "Estimating sperm whale cue rates to inform passive acoustic density estimation via cue counting", submitted to The Journal of the Acoustical Society of America, by **add all names here**. 
 
-In the paper we report on estimates of cue rates for sperm whales at a selection of time and year combinations that were sampled, but the main interest is in estimating a mean cue rate, and corresponding precision, for a time and location that might not have been observed. We also look at how a number of additional covariates can impact cue rates.
+In the paper we report on estimates of cue rates for sperm whales at a selection of time and year combinations that were sampled, but the main interest is in estimating a mean cue rate, and corresponding precision, for a time and location that might not have been observed. We also look at how a number of additional individual level covariates can impact cue rates.
 
 This is hosted in a dedicated github repository at
 
